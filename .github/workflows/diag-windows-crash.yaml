@@ -1,0 +1,105 @@
+# Scratch: why a test worker crashes on Windows (deleted with its branch).
+name: Diagnose the Windows crash
+
+on:
+  push:
+    branches: [diag/windows-crash]
+
+permissions: {}
+
+jobs:
+  diagnose:
+    name: ${{ matrix.mode }} on Python ${{ matrix.python-version }} (${{ matrix.attempt }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { mode: suite, python-version: "3.13", attempt: 1 }
+          - { mode: suite, python-version: "3.13", attempt: 2 }
+          - { mode: suite-uncovered, python-version: "3.13", attempt: 1 }
+          - { mode: alone, python-version: "3.13", attempt: 1 }
+          - { mode: alone, python-version: "3.14", attempt: 1 }
+    runs-on: windows-2025
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      actions: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      COVERAGE_FILE: ${{ github.workspace }}/.coverage.diag
+      UV_NO_SYNC: "1"
+      PYTHONFAULTHANDLER: "1"
+      RUST_BACKTRACE: full
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: just
+
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # the wheel main's run built from this tree
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: wheel-windows-2025
+          path: dist
+          run-id: 39570805202
+          github-token: ${{ github.token }}
+
+      - name: Install the wheel and test dependencies
+        run: |
+          uv sync --frozen --no-install-project
+          uv pip install --no-deps dist/*.whl
+
+      - name: Keep a dump of a crashed Python
+        shell: pwsh
+        run: |
+          $key = "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\python.exe"
+          New-Item -Path $key -Force | Out-Null
+          Set-ItemProperty -Path $key -Name DumpFolder -Value "D:\dumps" -Type ExpandString
+          Set-ItemProperty -Path $key -Name DumpType -Value 1 -Type DWord
+          Set-ItemProperty -Path $key -Name DumpCount -Value 10 -Type DWord
+          New-Item -ItemType Directory -Force -Path D:\dumps | Out-Null
+
+      - name: Run
+        continue-on-error: true
+        run: |
+          case "${{ matrix.mode }}" in
+            suite) just test-coverage -v --ignore=tests/integration/test_corpus.py ;;
+            suite-uncovered) uv run --frozen pytest -n auto -v --ignore=tests/integration/test_corpus.py ;;
+            alone)
+              for round in 1 2 3 4 5 6; do
+                echo "=== round $round"
+                uv run --frozen --no-sync python -X faulthandler -m pytest -p no:xdist -p no:randomly \
+                  -p no:cacheprovider -s -v \
+                  "tests/integration/test_video.py::test_eviction_preserves_queued_transparency_retries" \
+                  && echo "=== round $round passed" || echo "=== round $round exited with $?"
+              done ;;
+          esac
+
+      - name: Read the dumps
+        if: always()
+        run: |
+          ls -la /d/dumps || true
+          cdb="/c/Program Files (x86)/Windows Kits/10/Debuggers/x64/cdb.exe"
+          [ -x "$cdb" ] || { echo "no cdb"; exit 0; }
+          for dump in /d/dumps/*.dmp; do
+            [ -e "$dump" ] || continue
+            echo "=== $dump"
+            "$cdb" -z "$(cygpath -w "$dump")" -c ".ecxr; kv 80; ~*kv 40; !analyze -v; q" | tail -400
+          done
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: dumps-${{ matrix.mode }}-${{ matrix.python-version }}-${{ matrix.attempt }}
+          path: D:\dumps
+          if-no-files-found: ignore
+          retention-days: 3
